@@ -1,0 +1,20 @@
+ClrHome
+ClrDraw
+Disp "TI-32 LINK TEST
+Disp "SENDING...
+
+42069->P
+Send(P)
+
+3->C
+Send(C)
+
+0->S
+Repeat S
+Get(S)
+End
+
+ClrHome
+Get(Str1)
+Disp Str1
+Pause 

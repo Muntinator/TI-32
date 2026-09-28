@@ -4,17 +4,32 @@
 
 #include "./secrets.h"
 #include "./launcher.h"
-#include <TICL.h>
-#include <CBL2.h>
-#include <TIVar.h>
+// ArTICL (the TI link layer) is vendored in this folder as TICL.*/CBL2.*/
+// TIVar.* so the sketch needs no library install. See ArTICL-LICENSE.txt.
+#include "TICL.h"
+#include "CBL2.h"
+#include "TIVar.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiClient.h>
 #include <HTTPClient.h>
 #include <UrlEncode.h>
 #include <Preferences.h>
+#include <esp_wifi.h>
 
 // #define CAMERA
+
+// Fallbacks so an older secrets.h (from before direct AI mode existed) still
+// compiles: with an empty key the board just uses SERVER like it used to.
+#ifndef AI_API_URL
+#define AI_API_URL "https://integrate.api.nvidia.com/v1/chat/completions"
+#endif
+#ifndef AI_API_KEY
+#define AI_API_KEY ""
+#endif
+#ifndef AI_MODEL
+#define AI_MODEL "meta/llama-3.1-8b-instruct"
+#endif
 
 #ifdef CAMERA
 #include <esp_camera.h>
@@ -23,6 +38,22 @@
 #include "./camera_index.h"
 #endif
 
+// ---------------------------------------------------------------------------
+// LINK WIRING
+// ---------------------------------------------------------------------------
+// Wires-only build (no cheating-calc PCB, no MOSFETs): three wires straight
+// from the calculator's 2.5mm I/O jack to the XIAO ESP32C3:
+//
+//   calculator TIP (red)    -> D1,  GPIO3
+//   calculator RING (white) -> D10, GPIO10
+//   calculator GND (bare)   -> GND
+//
+// On the PCB the MMBF170s level shifted these lines to the board's +5V rail
+// (R3/R4) while R1/R2 pulled the ESP32 side up to +3.3V. Bare wires do none of
+// that, so the firmware holds both lines high with the ESP32's own pull-ups
+// (see idleLines) and the XIAO has to be powered from USB-C instead of from
+// the calculator. Using a bare ESP32-C3 instead of a XIAO? Put the raw GPIO
+// numbers here; 3 and 10 are both plain pins, not boot strapping pins.
 constexpr auto TIP = D1;
 constexpr auto RING = D10;
 constexpr auto MAXHDRLEN = 16;
@@ -31,13 +62,37 @@ constexpr auto MAXARGS = 5;
 constexpr auto MAXSTRARGLEN = 256;
 constexpr auto PICSIZE = 756;
 constexpr auto PICVARSIZE = PICSIZE + 2;
-constexpr auto PASSWORD = 69420;
+// The launcher compiled into this sketch (launcher.h) unlocks by storing 42069
+// into the calculator's P variable and sending it, but this sketch only used
+// to accept 69420, which left a freshly flashed board locked out with nothing
+// but "failed unlock" on the serial console. Accept both so the two halves
+// can't disagree, and see PASSWORDLESS in secrets.h to skip the unlock
+// entirely while bringing a hand wired link up.
+constexpr long long PASSWORDS[] = {69420, 42069};
 
 CBL2 cbl;
 Preferences prefs;
 
+// Startup auto-install. The launcher is already compiled into this sketch, so
+// the board can just offer it to the calculator instead of making you fetch a
+// link cable, transfer LAUNCHER.8xp with TI-Connect and then update it. Leave
+// the calculator at the home screen (or on LINK > RECEIVE) after flashing and
+// TI32 lands in its program list on its own. Disable with AUTOLAUNCH in
+// secrets.h if you would rather the board kept quiet on the link at boot.
+#ifdef AUTOLAUNCH
+constexpr int AUTOLAUNCH_ATTEMPTS = 24;
+constexpr unsigned long AUTOLAUNCH_INTERVAL_MS = 5000;
+int autolaunchAttempts = 0;
+unsigned long lastAutolaunchAttempt = 0;
+bool launcherInstalled = false;
+#endif
+
 // whether or not the user has entered the password
+#ifdef PASSWORDLESS
+bool unlocked = true;
+#else
 bool unlocked = false;
+#endif
 
 // Arguments
 int currentArg = 0;
@@ -80,7 +135,10 @@ void program_list();
 void fetch_program();
 void sendPage();
 void reply();
-void clearChat(); 
+void clearChat();
+void linktest();
+bool pushLauncher();
+void applyWifiMac();
 
 struct Command
 {
@@ -95,6 +153,7 @@ struct Command commands[] = {
     {0, "connect", 0, connect, false},
     {1, "disconnect", 0, disconnect, false},
     {2, "gpt", 1, gpt, true},
+    {3, "linktest", 0, linktest, false},
     {4, "send", 2, send, true},
     {5, "launcher", 0, launcher, false},
     {7, "snap", 0, snap, false},
@@ -111,7 +170,9 @@ struct Command commands[] = {
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
-constexpr int MAXCOMMAND = 14;
+// Highest id in the table above. This said 14 for a while, which made commands
+// 15-17 (sendPage/reply/clearChat) unreachable from the calculator.
+constexpr int MAXCOMMAND = 17;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -173,6 +234,56 @@ int sendProgramVariable(const char *name, uint8_t *program, size_t variableSize)
 
 bool camera_sign = false;
 
+bool isPassword(long long value)
+{
+  for (auto candidate : PASSWORDS)
+  {
+    if (candidate == value)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Hold both link lines high while nobody is driving them. The PCB did this with
+// R1/R2; on a straight-wire build the ESP32's internal pull-up does it and no
+// external resistors are needed - CBL2 only ever pulls a line low and then
+// releases it, so the MCU's own ~45k pull-ups are the intended way to bias the
+// link. If a line misbehaves, recheck the wiring (TIP/RING/GND) and the unlock
+// value before suspecting the pull-ups.
+void idleLines()
+{
+  pinMode(TIP, INPUT_PULLUP);
+  pinMode(RING, INPUT_PULLUP);
+}
+
+// What the two link lines look like right now. Both idle high on a healthy
+// link, so a line stuck low means a swapped wire, a short to GND, or another
+// device still holding the link.
+void linkStatus(char *out, size_t outLen)
+{
+  snprintf(out, outLen, "TIP %d RING %d", digitalRead(TIP), digitalRead(RING));
+}
+
+void reportWiring()
+{
+  char status[MAXSTRARGLEN];
+  linkStatus(status, sizeof(status));
+  Serial.print("[wiring] ");
+  Serial.println(status);
+  if (digitalRead(TIP) == LOW || digitalRead(RING) == LOW)
+  {
+    Serial.println("[wiring] a link line is held low right now");
+    Serial.println("[wiring] check for a TIP/RING swap or a short to GND");
+  }
+  else
+  {
+    Serial.println("[wiring] both lines idle high - run LINKTEST on the");
+    Serial.println("[wiring] calculator to prove the link end to end");
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -186,8 +297,11 @@ void setup()
   cbl.setupCallbacks(header, data, MAXDATALEN, onReceived, onRequest);
   // cbl.setVerbosity(true, (HardwareSerial *)&Serial);
 
-  pinMode(TIP, INPUT);
-  pinMode(RING, INPUT);
+  // The PCB's pull-ups (R1/R2) used to sit on these nets; with bare wires the
+  // ESP32 has to hold the link lines up itself or they float.
+  idleLines();
+
+  applyWifiMac();
 
   Serial.println("[preferences]");
   prefs.begin("ccalc", false);
@@ -277,6 +391,18 @@ void setup()
   memset(data, 0, MAXDATALEN);
   memset(header, 0, 16);
   Serial.println("[ready]");
+  reportWiring();
+
+#ifdef AUTOLAUNCH
+  Serial.println("[launcher] offering TI32 to the calculator");
+  pushLauncher();
+  if (!launcherInstalled)
+  {
+    Serial.println("[launcher] if nothing arrives, put the calculator on");
+    Serial.println("[launcher] LINK > RECEIVE and reset the XIAO");
+  }
+  lastAutolaunchAttempt = millis();
+#endif
 }
 
 void (*queued_action)() = NULL;
@@ -313,6 +439,27 @@ void loop()
       }
     }
   }
+#ifdef AUTOLAUNCH
+  // Keep offering the launcher until the calculator takes it, then stop for
+  // good so the board does not keep talking over the link during normal use.
+  if (!launcherInstalled && !queued_action && command < 0 &&
+      autolaunchAttempts < AUTOLAUNCH_ATTEMPTS &&
+      millis() - lastAutolaunchAttempt >= AUTOLAUNCH_INTERVAL_MS)
+  {
+    lastAutolaunchAttempt = millis();
+    ++autolaunchAttempts;
+    Serial.print("[launcher] attempt ");
+    Serial.print(autolaunchAttempts);
+    Serial.print("/");
+    Serial.println(AUTOLAUNCH_ATTEMPTS);
+    if (!pushLauncher() && autolaunchAttempts >= AUTOLAUNCH_ATTEMPTS)
+    {
+      Serial.println("[launcher] giving up - put the calculator on");
+      Serial.println("[launcher] LINK > RECEIVE and reset the XIAO, or run");
+      Serial.println("[launcher] LINKTEST once the link is proven");
+    }
+  }
+#endif
   cbl.eventLoopTick();
 }
 
@@ -327,7 +474,7 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen)
   if (!unlocked && varName == 'P')
   {
     auto password = TIVar::realToLong8x(data, model);
-    if (password == PASSWORD)
+    if (isPassword(password))
     {
       Serial.println("successful unlock");
       unlocked = true;
@@ -505,6 +652,14 @@ int makeRequest(String url, char *result, int resultLen, size_t *len)
 {
   memset(result, 0, resultLen);
 
+  if (SERVER[0] == '\0')
+  {
+    // Nothing to talk to: GPT still works when AI_API_KEY is set, and every
+    // other server-backed command says so through requireServer().
+    Serial.println("makeRequest: no SERVER set in secrets.h");
+    return -1;
+  }
+
 #ifdef SECURE
   WiFiClientSecure client;
   client.setInsecure();
@@ -553,6 +708,287 @@ int makeRequest(String url, char *result, int resultLen, size_t *len)
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// DIRECT AI MODE (board instead of the companion server)
+// ---------------------------------------------------------------------------
+// The ESP32 can call the model over HTTPS by itself, so you do not have to keep
+// a computer running server/index.mjs to use the GPT commands. Put a key in
+// AI_API_KEY in secrets.h and ASK/HISTORY go straight out from the board.
+//
+// The default is NVIDIA's hosted NIM API (build.nvidia.com), but any provider
+// that speaks the OpenAI-compatible /v1/chat/completions shape works: only
+// AI_API_URL, AI_API_KEY and AI_MODEL change, nothing else in this file.
+// Images, chat rooms and the programs list are files on the companion server,
+// so those still need it - the board says which one is missing instead of
+// failing with a generic error.
+constexpr auto AI_SYSTEM_PROMPT = "Do not use emojis. ";
+// Keep answers small enough to page onto the calculator without building a huge
+// JSON payload on a board with very little RAM.
+constexpr auto AI_MAX_TOKENS = 512;
+
+bool directAI()
+{
+  return AI_API_KEY[0] != '\0';
+}
+
+// NVIDIA keys start with "nvapi-", OpenAI's with "sk-"; both are just reported
+// so the serial log makes it obvious which provider the board is actually using.
+const char *aiProvider()
+{
+  if (strstr(AI_API_URL, "nvidia") != NULL)
+  {
+    return "nvidia nim";
+  }
+  if (strstr(AI_API_URL, "openai") != NULL)
+  {
+    return "openai";
+  }
+  return "custom";
+}
+
+// Escape a string so it can sit inside a JSON string literal.
+String jsonEscape(const String &in)
+{
+  String out;
+  for (size_t i = 0; i < in.length(); ++i)
+  {
+    char c = in[i];
+    switch (c)
+    {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if ((unsigned char)c >= 0x20)
+      {
+        out += c;
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+// Pull "content":"..." out of a chat completion response. Newlines become
+// spaces because the calculator prints these strings a line at a time.
+bool extractContent(const String &json, char *out, size_t outLen)
+{
+  int at = json.indexOf("\"content\":");
+  if (at < 0)
+  {
+    return false;
+  }
+  int i = json.indexOf('"', at + 10);
+  if (i < 0)
+  {
+    return false;
+  }
+  ++i;
+
+  size_t o = 0;
+  while (i < (int)json.length() && o + 1 < outLen)
+  {
+    char c = json[i];
+    if (c == '\\')
+    {
+      char next = json[i + 1];
+      if (next == 'n' || next == 'r' || next == 't')
+      {
+        c = ' ';
+      }
+      else if (next == '"' || next == '\\' || next == '/')
+      {
+        c = next;
+      }
+      else
+      {
+        // Unknown escape (say \uXXXX): keep the character itself.
+        ++i;
+        continue;
+      }
+      i += 2;
+    }
+    else if (c == '"')
+    {
+      break; // end of the content string
+    }
+    else
+    {
+      ++i;
+    }
+    out[o++] = c;
+  }
+  out[o] = '\0';
+  return o > 0;
+}
+
+// One question, one answer, no server in between.
+bool askModel(const String &prompt, char *out, size_t outLen)
+{
+  // The board has no CA bundle, so certificate checking is off. Same trade-off
+  // the sketch already makes for the companion server under SECURE.
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, AI_API_URL))
+  {
+    Serial.println("ai: bad url");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + String(AI_API_KEY));
+
+  // stream is off on purpose: the non-streaming reply is a single JSON body,
+  // which is the only shape this parser handles.
+  String body = String("{\"model\":\"") + AI_MODEL +
+                "\",\"stream\":false,\"max_tokens\":" + String(AI_MAX_TOKENS) +
+                ",\"messages\":[{\"role\":\"system\",\"content\":\"" + AI_SYSTEM_PROMPT +
+                "\"},{\"role\":\"user\",\"content\":\"" + jsonEscape(prompt) + "\"}]}";
+
+  Serial.print("ai provider: ");
+  Serial.println(aiProvider());
+  Serial.print("ai model: ");
+  Serial.println(AI_MODEL);
+  Serial.print("ai body: ");
+  Serial.println(body.length());
+
+  int code = http.POST(body);
+  Serial.print("ai status: ");
+  Serial.println(code);
+  if (code != 200)
+  {
+    // 401/403 is almost always the key, not the wiring or the network. NVIDIA
+    // keys also need the "Public API Endpoints" permission, which the Get API
+    // Key button on a build.nvidia.com model page provisions automatically.
+    Serial.println("ai: request rejected - check AI_API_KEY (and that the key");
+    Serial.println("ai: has access to AI_MODEL on this provider)");
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  memset(out, 0, outLen);
+  if (!extractContent(payload, out, outLen))
+  {
+    Serial.println("ai: no content in response");
+    return false;
+  }
+  return true;
+}
+
+// Images, chat rooms and the programs list are files on the companion server,
+// so they need one configured. GPT does not when a key is set.
+bool requireServer()
+{
+  if (directAI() && SERVER[0] == '\0')
+  {
+    setError("no server: images/chat/programs need it");
+    return false;
+  }
+  if (SERVER[0] == '\0')
+  {
+    setError("set AI_API_KEY or SERVER in secrets.h");
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONAL FIXED WIFI MAC ADDRESS
+// ---------------------------------------------------------------------------
+// Setting WIFI_MAC in secrets.h makes the router always see the same device,
+// which is what you want for a DHCP reservation or a MAC allow-list. The
+// override has to be applied before WiFi.begin() and is not remembered across
+// reboots, so it is re-applied on every boot. It does not make the board any
+// harder to identify - MAC addresses are trivial to spoof, so never treat an
+// allow-list as security.
+bool parseMac(const char *text, uint8_t out[6])
+{
+  unsigned int parts[6] = {0, 0, 0, 0, 0, 0};
+  if (sscanf(text, "%x:%x:%x:%x:%x:%x", &parts[0], &parts[1], &parts[2],
+             &parts[3], &parts[4], &parts[5]) != 6)
+  {
+    return false;
+  }
+  for (int i = 0; i < 6; ++i)
+  {
+    if (parts[i] > 0xFF)
+    {
+      return false;
+    }
+    out[i] = (uint8_t)parts[i];
+  }
+  return true;
+}
+
+void printMac(const char *label, uint8_t mac[6])
+{
+  char text[18];
+  snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.print(label);
+  Serial.println(text);
+}
+
+void applyWifiMac()
+{
+  if (WIFI_MAC[0] == '\0')
+  {
+    return; // not configured: leave the WiFi driver alone until connect()
+  }
+
+  WiFi.mode(WIFI_STA); // the driver has to be up before the address can change
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  printMac("[mac] hardware: ", mac);
+
+  if (!parseMac(WIFI_MAC, mac))
+  {
+    Serial.println("[mac] WIFI_MAC must look like AA:BB:CC:DD:EE:FF");
+    Serial.println("[mac] keeping the hardware address");
+    return;
+  }
+  if (mac[0] & 0x01)
+  {
+    Serial.println("[mac] a multicast address is not valid here");
+    Serial.println("[mac] keeping the hardware address");
+    return;
+  }
+  if (!(mac[0] & 0x02))
+  {
+    Serial.println("[mac] note: set the locally administered bit (make the");
+    Serial.println("[mac] second hex digit a 2, 6, A or E) so you are not");
+    Serial.println("[mac] borrowing a real vendor's address");
+  }
+
+  if (esp_wifi_set_mac(WIFI_IF_STA, mac) == ESP_OK)
+  {
+    uint8_t applied[6];
+    WiFi.macAddress(applied);
+    printMac("[mac] using:    ", applied);
+  }
+  else
+  {
+    Serial.println("[mac] esp_wifi_set_mac failed - using the hardware address");
+  }
+}
+
 void connect()
 {
   const char *ssid = WIFI_SSID;
@@ -583,6 +1019,21 @@ void clearChat() {
   fullResponse = "";
 }
 
+// Command 3 ("linktest"): the calculator asks what the two link lines look like
+// right now. If the calculator can display this reply at all, then TIP, RING
+// and GND are connected correctly in both directions - the wire build works.
+void linktest()
+{
+  char status[MAXSTRARGLEN];
+  linkStatus(status, sizeof(status));
+  Serial.print("[wiring] linktest: ");
+  Serial.println(status);
+
+  char reply[MAXSTRARGLEN];
+  snprintf(reply, sizeof(reply), "LINK OK %s", status);
+  setSuccess(reply);
+}
+
 void reply() {
   Serial.println("Reply action initiated");
   const char* userReply = strArgs[0];
@@ -592,18 +1043,31 @@ void reply() {
   fullResponse += "| User: " + String(userReply) + "| AI: ";
   Serial.print("full response: ");
   Serial.println(fullResponse);
-  // Send the updated conversation to the server
-  auto url = String(SERVER) + String("/gpt/ask?question=") + urlEncode(fullResponse);
-  Serial.println("made url");
-  Serial.println(url);
 
-  size_t realsize = 0;
-  Serial.println("sending request");
-  if (makeRequest(url, response, MAXHTTPRESPONSELEN, &realsize)) {
-    setError("error making request");
-    return;
+  if (directAI())
+  {
+    // Straight to the model, no server in between.
+    if (!askModel(fullResponse, response, MAXHTTPRESPONSELEN))
+    {
+      setError("ai request failed");
+      return;
+    }
   }
-  Serial.println("request recieved");
+  else
+  {
+    // Send the updated conversation to the server
+    auto url = String(SERVER) + String("/gpt/ask?question=") + urlEncode(fullResponse);
+    Serial.println("made url");
+    Serial.println(url);
+
+    size_t realsize = 0;
+    Serial.println("sending request");
+    if (makeRequest(url, response, MAXHTTPRESPONSELEN, &realsize)) {
+      setError("error making request");
+      return;
+    }
+    Serial.println("request recieved");
+  }
 
   // Update fullResponse with the new AI response
   fullResponse += String(response);
@@ -619,12 +1083,24 @@ void gpt() {
 
   fullResponse = "User: " + String(prompt) + " | AI: ";
 
-  auto url = String(SERVER) + String("/gpt/ask?question=") + urlEncode(String(prompt));
+  if (directAI())
+  {
+    // Straight to the model, no server in between.
+    if (!askModel(String(prompt), response, MAXHTTPRESPONSELEN))
+    {
+      setError("ai request failed");
+      return;
+    }
+  }
+  else
+  {
+    auto url = String(SERVER) + String("/gpt/ask?question=") + urlEncode(String(prompt));
 
-  size_t realsize = 0;
-  if (makeRequest(url, response, MAXHTTPRESPONSELEN, &realsize)) {
-    setError("error making request");
-    return;
+    size_t realsize = 0;
+    if (makeRequest(url, response, MAXHTTPRESPONSELEN, &realsize)) {
+      setError("error making request");
+      return;
+    }
   }
 
   fullResponse += String(response);
@@ -655,9 +1131,26 @@ void send()
   setSuccess("OK: sent");
 }
 
+// Hand the launcher built into this sketch (launcher.h) to the calculator.
+// The protocol is sender-initiated, so the board can start the transfer on its
+// own as long as the calculator is willing to take a variable. Returns true once
+// the calculator has accepted it.
+bool pushLauncher()
+{
+  if (sendProgramVariable("TI32", __launcher_var, __launcher_var_len) == 0)
+  {
+    launcherInstalled = true;
+    Serial.println("[launcher] TI32 is on the calculator - run it from PRGM");
+    return true;
+  }
+
+  Serial.println("[launcher] calculator did not take TI32, will try again");
+  return false;
+}
+
 void _sendLauncher()
 {
-  sendProgramVariable("TI32", __launcher_var, __launcher_var_len);
+  pushLauncher();
 }
 
 void launcher()
@@ -694,6 +1187,10 @@ void solve()
 
 void image_list()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   int page = realArgs[0];
   auto url = String(SERVER) + String("/image/list?p=") + urlEncode(String(page));
 
@@ -712,6 +1209,10 @@ void image_list()
 
 void fetch_image()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   memset(frame + 2, 0, 756);
   // fetch image and put it into the frame variable
   int id = realArgs[0];
@@ -745,6 +1246,10 @@ void fetch_image()
 
 void fetch_chats()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   int room = realArgs[0];
   int page = realArgs[1];
   auto url = String(SERVER) + String("/chats/messages?p=") + urlEncode(String(page)) + String("&c=") + urlEncode(String(room));
@@ -764,6 +1269,10 @@ void fetch_chats()
 
 void send_chat()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   int room = realArgs[0];
   const char *msg = strArgs[1];
 
@@ -790,6 +1299,10 @@ void send_chat()
 
 void program_list()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   int page = realArgs[0];
   auto url = String(SERVER) + String("/programs/list?p=") + urlEncode(String(page));
 
@@ -832,6 +1345,10 @@ void _sendDownloadedProgram()
 
 void fetch_program()
 {
+  if (!requireServer())
+  {
+    return;
+  }
   int id = realArgs[0];
   Serial.print("id: ");
   Serial.println(id);

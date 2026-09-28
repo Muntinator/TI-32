@@ -2,17 +2,21 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import _ from "lodash";
-import * as p8 from "../../prepare8xp.mjs";
+import * as p8 from "../../source/prepare8xp.mjs";
 
 export function programs() {
   const router = express.Router();
 
   const programDir = path.join(process.cwd(), "programs");
 
-  const programs = fs.readdirSync(programDir, {
-    withFileTypes: false,
-    encoding: "ascii",
-  });
+  // The APPS menu is optional, so an empty or missing programs/ directory must
+  // not stop the whole server from starting.
+  const programs = fs.existsSync(programDir)
+    ? fs.readdirSync(programDir, {
+        withFileTypes: false,
+        encoding: "ascii",
+      })
+    : [];
 
   const len = 16;
   const list_len = 4;
